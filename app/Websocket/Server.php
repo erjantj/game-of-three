@@ -43,65 +43,117 @@ class Server
         echo "Waiting for players...\n";
 
         while (true) {
-            $this->processDataFromClient($socket);
+            // Handle messages to client
             $this->sendDataToClients();
+
+            // Wait for active connections
+            $activeConnections = $this->selectActiveConnections($socket);
+            if (!$activeConnections) {
+                break;
+            }
+
+            if (in_array($socket, $activeConnections)) {
+                // Handle new clients
+                $this->handleClient($socket);
+                unset($activeConnections[array_search($socket, $activeConnections)]);
+            }
+
+            // Process client requests
+            $this->processClients($activeConnections);
+
             sleep(1);
         }
 
         fclose($server);
     }
 
+    /**
+     * Wait and get active connections
+     * @param  resource $socket server socket
+     * @return iterable
+     */
+    public function selectActiveConnections($socket)
+    {
+        $read = $this->connects;
+        $read[] = $socket;
+        $write = $except = null;
+
+        if (!stream_select($read, $write, $except, null)) {
+            return null;
+        }
+
+        return $read;
+    }
+
+    /**
+     * Send messages to clients
+     */
     public function sendDataToClients()
     {
-        if ($this->messageQueue) {
+        while ($this->messageQueue) {
             ['message' => $message, 'connections' => $connects] =
                 array_shift($this->messageQueue);
 
-            $this->send(json_encode($message), $connects);
+            // if not connections specified send to all
+            if (!$connects) {
+                $connects = $this->connects;
+            }
+
+            $dataEncoded = MessageEncoder::encode(json_encode($message));
+            foreach ($connects as $connect) {
+                fwrite($connect, $dataEncoded);
+            }
         }
     }
 
-    public function send(string $data, iterable $connects)
+    /**
+     * Handle new client
+     * @param  resource $socket server socket
+     */
+    public function handleClient($socket)
     {
-        foreach ($connects as $connect) {
-            print_r([$connect, $data]);
-            fwrite($connect, $data);
+        if (!$this->started) {
+            // if new connection, accept connection and make handshake
+            if (
+                ($connect = stream_socket_accept($socket, -1)) &&
+                $info = $this->handshake($connect)
+            ) {
+                $username = $this->generateUsername();
+                // add to array to process
+                $this->connects[$username] = $connect;
+                $this->players[] = $username;
+
+                $this->greetNewPlayer($username);
+                $this->checkGameStarted();
+            }
         }
     }
 
-    public function processDataFromClient($socket)
+    /**
+     * Process client requests
+     * @param  iterable $connections client connections
+     */
+    public function processClients($connections)
     {
-        // if new connection, accept connection and make handshake
-        if (
-            ($connect = stream_socket_accept($socket, -1)) &&
-            $info = $this->handshake($connect)
-        ) {
-            $username = $this->generateUsername();
-            // add to array to process
-            $this->connects[$username] = $connect;
-            $this->players[] = $username;
+        // Game started
+        if ($this->started) {
+            foreach ($connections as $username => $connect) {
+                // process connections
+                $data = fread($connect, 100000);
+                if (!$data) {
+                    $this->onClose($connect); // call close scenario
+                    continue;
+                }
 
-            $this->greetNewPlayer($username);
-            $this->checkGameStarted();
+                $this->onMessage($data, $username); // call on message scenario
+            }
         }
-
-        // // Game started
-        // if ($this->started) {
-        //     foreach ($read as $id => $connect) {
-        //         // process connections
-        //         $data = fread($connect, 100000);
-        //         if (!$data) {
-        //             // connection closed
-        //             fclose($connect);
-        //             unset($this->connects[array_search($connect, $this->connects)]);
-        //             $this->onClose($connect); // call close scenario
-        //             continue;
-        //         }
-        //         $this->onMessage($this->connects, $data, $id); // call on message scenario
-        //     }
-        // }
     }
 
+    /**
+     * Greet new player and send username to player
+     * @param  string $username player username
+     */
     public function greetNewPlayer(string $username)
     {
         $this->pushMessage([
@@ -112,6 +164,10 @@ class Server
         echo "🤓 Connected player {$username}\n";
     }
 
+    /**
+     * Check if game started, if started ask first client for random number
+     * @return [type] [description]
+     */
     public function checkGameStarted()
     {
         if (count($this->players) >= $this->playersCount) {
@@ -178,18 +234,23 @@ class Server
 
     public function onClose($connect)
     {
-        // echo "close\n";
+        // connection closed
+        fclose($connect);
+        unset($this->connects[array_search($connect, $this->connects)]);
     }
 
-    public function onMessage($connects, $data, $username)
+    /**
+     * Handle client messages
+     * @param  string $data     client data
+     * @param  string $username client username
+     */
+    public function onMessage(string $data, string $username)
     {
         $dataDecoded = MessageEncoder::decode($data);
-
-        if ($dataDecoded['type'] == 'ping' && isset($this->connects[$username])) {
-            fwrite($this->connects[$username], MessageEncoder::encode('ping', 'pong', true));
-        } else if (MessageEncoder::isJson($dataDecoded['payload'])) {
+        if (MessageEncoder::isJson($dataDecoded['payload'])) {
             $data = json_decode($dataDecoded['payload'], true);
             ['command' => $command, 'value' => $value] = $data;
+
             switch ($command) {
                 case Commands::MOVE:
                     $this->move($username, $value);
@@ -198,37 +259,38 @@ class Server
         }
     }
 
+    /**
+     * Handle client move, if client move is equal to 1, then end game
+     * @param  string $username client username
+     * @param  string $value    client move value
+     */
     public function move($username, $value)
     {
         echo "🤓 $username: {$value}\n";
 
         if ($value !== 1) {
-            $data = [
+            $this->pushMessage([
                 'command' => Commands::MOVE,
                 'value' => $value,
-            ];
-
-            $connect = $this->getNextPlayer($username);
-            $dataEncoded = MessageEncoder::encode(json_encode($data));
-            fwrite($connect, $dataEncoded);
+            ], [$this->getNextPlayer($username)]);
         } else {
             echo "🎉 Winner is {$username}\n";
 
-            $data = [
+            $this->pushMessage([
                 'command' => Commands::WIN,
                 'value' => $username,
-            ];
-
-            $dataEncoded = MessageEncoder::encode(json_encode($data));
-            foreach ($this->connects as $connect) {
-                fwrite($connect, $dataEncoded);
-            }
+            ]);
 
             $this->endGame();
         }
     }
 
-    public function getNextPlayer($username)
+    /**
+     * Next next player connection
+     * @param  string $username client username
+     * @return resource
+     */
+    public function getNextPlayer(string $username)
     {
         $nextPlayerIndex = (array_search($username, $this->players) + 1) % count($this->players);
         $nextPlayerUsername = $this->players[$nextPlayerIndex];
@@ -236,7 +298,11 @@ class Server
         return $this->connects[$nextPlayerUsername];
     }
 
-    public function generateUsername()
+    /**
+     * Generate random username for client
+     * @return string
+     */
+    public function generateUsername(): string
     {
         $username = $this->faker->firstName;
 
@@ -247,12 +313,28 @@ class Server
         return $username;
     }
 
+    /**
+     * End game logic
+     */
     public function endGame()
     {
+        // Handle messages to client
+        $this->sendDataToClients();
+
+        // Close all connections
+        foreach ($this->connects as $connect) {
+            $this->onClose($connect);
+        }
+
         echo "🏁 End of game";
         exit(0);
     }
 
+    /**
+     * Get player connection by username
+     * @param  string $username client username
+     * @return resource
+     */
     public function getPlayerConnection(string $username)
     {
         return $this->connects[$username];
@@ -266,4 +348,4 @@ class Server
     {
         $this->messageQueue[] = ['message' => $message, 'connections' => $connections];
     }
-}
+};
